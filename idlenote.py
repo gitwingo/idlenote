@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 """
 IdleNote — Idle-triggered scratchpad.
 Appears when keyboard+mouse both idle. Closes only on ✕.
@@ -14,6 +15,8 @@ import sys
 import json
 import datetime
 import platform
+import signal
+import subprocess
 
 # ── Tray ──────────────────────────────────────────────────────────────────────
 try:
@@ -34,12 +37,11 @@ except ImportError:
 # PATHS
 # ──────────────────────────────────────────────────────────────────────────────
 if getattr(sys, 'frozen', False):
-    # Running as PyInstaller exe
     BASE_DIR = os.path.dirname(sys.executable)
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-APP_DIR       = os.path.join(os.path.expanduser("~"), ".idlenote")
+APP_DIR    = os.path.join(os.path.expanduser("~"), ".idlenote")
 NOTES_FILE    = os.path.join(APP_DIR, "notes.txt")
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
 os.makedirs(APP_DIR, exist_ok=True)
@@ -47,10 +49,10 @@ os.makedirs(APP_DIR, exist_ok=True)
 DEFAULT_SETTINGS = {
     "kb_idle_secs":    5,
     "mouse_idle_secs": 8,
-    "win_x":  None,
-    "win_y":  None,
-    "width":  360,
-    "height": 260,
+    "win_x":   None,
+    "win_y":   None,
+    "width":   360,
+    "height":  260,
     "opacity": 0.95,
 }
 
@@ -70,10 +72,366 @@ def save_settings(s):
     except Exception:
         pass
 
+# ──────────────────────────────────────────────────────────────────────────────
+# MEDIA / CALL DETECTION  (Linux + Windows)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Process names that indicate an active video call or meeting
+_CALL_PROCESS_NAMES = {
+    # Zoom
+    "zoom", "zoom.exe",
+    # Microsoft Teams (classic + new)
+    "teams", "teams.exe", "ms-teams", "ms-teams.exe",
+    # Google Meet runs in browsers — handled separately via browser check
+    # Slack calls
+    "slack", "slack.exe",
+    # Discord voice/video
+    "discord", "discord.exe",
+    # Skype
+    "skype", "skype.exe",
+    # Webex
+    "webex", "webex.exe", "ciscowebexmeetings", "ciscowebexmeetings.exe",
+    # Jitsi
+    "jitsi meet", "jitsi",
+    # OBS (streaming / recording)
+    "obs", "obs64", "obs.exe",
+}
+
+# Browser process names (for Meet/Teams-web/etc.)
+_BROWSER_NAMES = {"chrome", "chromium", "firefox", "brave", "msedge",
+                  "opera", "vivaldi", "waterfox"}
+
+# Keywords in browser window titles that signal a live call / stream
+_CALL_TITLE_KEYWORDS = {
+    "google meet", "meet.google", "zoom meeting",
+    "microsoft teams", "teams meeting",
+    "slack call", "discord call",
+    "webex meeting", "jitsi",
+    "youtube live", "twitch",          # streaming (you're the viewer/host)
+}
+
+
+def _run(cmd):
+    """Run a shell command and return stdout, swallowing all errors."""
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=2
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+
+def is_audio_playing() -> bool:
+    """
+    Returns True if any application is currently sending audio to the
+    default output sink (i.e. music/video is actively playing).
+
+    Checks PulseAudio (pactl) and PipeWire (pw-cli) on Linux,
+    and the Windows Audio Session API on Windows.
+    """
+    system = platform.system()
+
+    if system == "Linux":
+        # ── PulseAudio ────────────────────────────────────────────────────
+        out = _run(["pactl", "list", "sink-inputs"])
+        if out:
+            # A "Corked" state means paused; "RUNNING" means active.
+            # We look for at least one non-corked sink-input.
+            import re
+            sinks = re.split(r"Sink Input #\d+", out)
+            for sink in sinks:
+                if "RUNNING" in sink:
+                    return True
+            # Fallback: any sink input at all with no corked flag
+            if "Corked: no" in out:
+                return True
+
+        # ── PipeWire fallback ─────────────────────────────────────────────
+        out = _run(["pw-cli", "list-objects", "PipeWire:Interface:Node"])
+        if out and "media.class = \"Audio/Sink\"" in out:
+            # crude but effective: if any node is in a running state
+            if "state: \"running\"" in out:
+                return True
+
+        return False
+
+    elif system == "Windows":
+        # Pure ctypes approach — no pycaw or comtypes needed.
+        # We use the Windows Core Audio API (WASAPI) to enumerate audio
+        # sessions and check their peak meter value. A non-zero peak means
+        # audio is actively being rendered (music, video, call audio, etc.).
+        try:
+            import ctypes
+            import ctypes.wintypes
+
+            # ── COM GUIDs we need ─────────────────────────────────────────
+            CLSID_MMDeviceEnumerator = "{BCDE0395-E52F-467C-8E3D-C4579291692E}"
+            IID_IMMDeviceEnumerator  = "{A95664D2-9614-4F35-A746-DE8DB63617E6}"
+            IID_IAudioSessionManager2 = "{77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F}"
+            IID_IAudioSessionEnumerator = "{E2F5BB11-0570-40CA-ACDD-3AA01277DEE8}"
+            IID_IAudioSessionControl2   = "{BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D}"
+            IID_IAudioMeterInformation  = "{C02216F6-8C67-4B5B-9D00-D008E73E0064}"
+
+            ole32    = ctypes.windll.ole32
+            ole32.CoInitialize(None)
+
+            # Helper to make a GUID struct from a string
+            class GUID(ctypes.Structure):
+                _fields_ = [
+                    ("Data1", ctypes.c_ulong),
+                    ("Data2", ctypes.c_ushort),
+                    ("Data3", ctypes.c_ushort),
+                    ("Data4", ctypes.c_ubyte * 8),
+                ]
+
+            def guid_from_str(s):
+                g = GUID()
+                ole32.CLSIDFromString(s, ctypes.byref(g))
+                return g
+
+            # Get the default audio render device
+            clsid    = guid_from_str(CLSID_MMDeviceEnumerator)
+            iid_enum = guid_from_str(IID_IMMDeviceEnumerator)
+            enumerator = ctypes.POINTER(ctypes.c_void_p)()
+            hr = ole32.CoCreateInstance(
+                ctypes.byref(clsid), None, 1,  # CLSCTX_INPROC_SERVER
+                ctypes.byref(iid_enum),
+                ctypes.byref(enumerator)
+            )
+            if hr != 0:
+                return False
+
+            # IMMDeviceEnumerator::GetDefaultAudioEndpoint
+            # eRender=0, eConsole=0
+            IMMDeviceEnumerator_vtbl_offset_GetDefault = 4
+            get_default = ctypes.cast(
+                ctypes.cast(enumerator, ctypes.POINTER(ctypes.c_void_p))[0],
+                ctypes.POINTER(ctypes.c_void_p)
+            )[IMMDeviceEnumerator_vtbl_offset_GetDefault]
+
+            device = ctypes.c_void_p()
+            GetDefaultAudioEndpoint = ctypes.WINFUNCTYPE(
+                ctypes.HRESULT,
+                ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint,
+                ctypes.POINTER(ctypes.c_void_p)
+            )(get_default)
+            hr = GetDefaultAudioEndpoint(enumerator, 0, 0, ctypes.byref(device))
+            if hr != 0 or not device:
+                return False
+
+            # IMMDevice::Activate → IAudioSessionManager2
+            iid_asm2  = guid_from_str(IID_IAudioSessionManager2)
+            IMMDevice_vtbl_offset_Activate = 3
+            activate_fn = ctypes.cast(
+                ctypes.cast(device, ctypes.POINTER(ctypes.c_void_p))[0],
+                ctypes.POINTER(ctypes.c_void_p)
+            )[IMMDevice_vtbl_offset_Activate]
+
+            asm2 = ctypes.c_void_p()
+            Activate = ctypes.WINFUNCTYPE(
+                ctypes.HRESULT,
+                ctypes.c_void_p,
+                ctypes.POINTER(GUID),
+                ctypes.c_uint,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+            )(activate_fn)
+            hr = Activate(device, ctypes.byref(iid_asm2), 0, None, ctypes.byref(asm2))
+            if hr != 0 or not asm2:
+                return False
+
+            # IAudioSessionManager2::GetSessionEnumerator
+            iid_se = guid_from_str(IID_IAudioSessionEnumerator)
+            GetSessionEnumerator = ctypes.WINFUNCTYPE(
+                ctypes.HRESULT,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+            )(ctypes.cast(
+                ctypes.cast(asm2, ctypes.POINTER(ctypes.c_void_p))[0],
+                ctypes.POINTER(ctypes.c_void_p)
+            )[5])
+
+            session_enum = ctypes.c_void_p()
+            hr = GetSessionEnumerator(asm2, ctypes.byref(session_enum))
+            if hr != 0 or not session_enum:
+                return False
+
+            # GetCount
+            GetCount = ctypes.WINFUNCTYPE(
+                ctypes.HRESULT, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)
+            )(ctypes.cast(
+                ctypes.cast(session_enum, ctypes.POINTER(ctypes.c_void_p))[0],
+                ctypes.POINTER(ctypes.c_void_p)
+            )[3])
+            count = ctypes.c_int(0)
+            GetCount(session_enum, ctypes.byref(count))
+
+            # GetSession + QueryInterface for IAudioMeterInformation
+            GetSession = ctypes.WINFUNCTYPE(
+                ctypes.HRESULT, ctypes.c_void_p, ctypes.c_int,
+                ctypes.POINTER(ctypes.c_void_p)
+            )(ctypes.cast(
+                ctypes.cast(session_enum, ctypes.POINTER(ctypes.c_void_p))[0],
+                ctypes.POINTER(ctypes.c_void_p)
+            )[4])
+
+            iid_meter = guid_from_str(IID_IAudioMeterInformation)
+            for i in range(count.value):
+                session_ctl = ctypes.c_void_p()
+                hr = GetSession(session_enum, i, ctypes.byref(session_ctl))
+                if hr != 0 or not session_ctl:
+                    continue
+
+                # QI for IAudioMeterInformation
+                meter = ctypes.c_void_p()
+                QueryInterface = ctypes.WINFUNCTYPE(
+                    ctypes.HRESULT, ctypes.c_void_p,
+                    ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p)
+                )(ctypes.cast(
+                    ctypes.cast(session_ctl, ctypes.POINTER(ctypes.c_void_p))[0],
+                    ctypes.POINTER(ctypes.c_void_p)
+                )[0])
+                hr = QueryInterface(session_ctl, ctypes.byref(iid_meter),
+                                    ctypes.byref(meter))
+                if hr != 0 or not meter:
+                    continue
+
+                # GetPeakValue
+                peak = ctypes.c_float(0.0)
+                GetPeakValue = ctypes.WINFUNCTYPE(
+                    ctypes.HRESULT, ctypes.c_void_p, ctypes.POINTER(ctypes.c_float)
+                )(ctypes.cast(
+                    ctypes.cast(meter, ctypes.POINTER(ctypes.c_void_p))[0],
+                    ctypes.POINTER(ctypes.c_void_p)
+                )[3])
+                GetPeakValue(meter, ctypes.byref(peak))
+                if peak.value > 0.001:   # non-trivial audio level
+                    return True
+
+        except Exception:
+            pass
+        return False
+
+    return False
+
+
+def _get_running_process_names() -> set:
+    """Return a lowercase set of currently running process names."""
+    system = platform.system()
+    names = set()
+    if system == "Linux":
+        out = _run(["ps", "-eo", "comm"])
+        if out:
+            names = {line.strip().lower() for line in out.splitlines() if line.strip()}
+    elif system == "Windows":
+        out = _run(["tasklist", "/fo", "csv", "/nh"])
+        if out:
+            import csv, io
+            for row in csv.reader(io.StringIO(out)):
+                if row:
+                    names.add(row[0].strip().lower())
+    return names
+
+
+def _get_browser_window_titles() -> list:
+    """
+    Return a list of current window titles for known browsers.
+    Uses xdotool on Linux (X11), wmctrl as fallback, and win32gui on Windows.
+    """
+    system = platform.system()
+    titles = []
+
+    if system == "Linux":
+        # xdotool is more reliable; wmctrl is a fallback
+        out = _run(["xdotool", "search", "--onlyvisible", "--name", ""])
+        if not out:
+            out = _run(["wmctrl", "-l"])
+            if out:
+                titles = [" ".join(line.split()[3:]).lower()
+                          for line in out.splitlines()]
+                return titles
+        # xdotool returns window IDs; get names
+        wids = out.splitlines()
+        for wid in wids[:40]:                   # cap to avoid slowness
+            name = _run(["xdotool", "getwindowname", wid.strip()])
+            if name:
+                titles.append(name.lower())
+
+    elif system == "Windows":
+        # Pure ctypes via user32.dll — no win32gui / pywin32 needed.
+        try:
+            import ctypes
+            import ctypes.wintypes
+
+            user32 = ctypes.windll.user32
+
+            # Callback type for EnumWindows
+            WNDENUMPROC = ctypes.WINFUNCTYPE(
+                ctypes.wintypes.BOOL,
+                ctypes.wintypes.HWND,
+                ctypes.wintypes.LPARAM,
+            )
+
+            buf = ctypes.create_unicode_buffer(512)
+
+            def _cb(hwnd, _lparam):
+                if user32.IsWindowVisible(hwnd):
+                    user32.GetWindowTextW(hwnd, buf, 512)
+                    t = buf.value
+                    if t:
+                        titles.append(t.lower())
+                return True   # continue enumeration
+
+            user32.EnumWindows(WNDENUMPROC(_cb), 0)
+        except Exception:
+            pass
+
+    return titles
+
+
+def is_call_or_stream_active() -> bool:
+    """
+    Returns True if a video call, meeting, or media stream is likely
+    in progress. Checks running processes and browser window titles.
+    """
+    procs = _get_running_process_names()
+
+    # Direct process match
+    for call_proc in _CALL_PROCESS_NAMES:
+        if call_proc in procs:
+            return True
+
+    # Browser open? Check window titles for call/stream keywords
+    browser_running = any(b in procs for b in _BROWSER_NAMES)
+    if browser_running:
+        titles = _get_browser_window_titles()
+        for title in titles:
+            for kw in _CALL_TITLE_KEYWORDS:
+                if kw in title:
+                    return True
+
+    return False
+
+
+def should_suppress() -> bool:
+    """
+    Master suppression check: returns True when IdleNote should NOT appear.
+    Runs quickly enough to be called every 500 ms.
+    """
+    try:
+        if is_audio_playing():
+            return True
+        if is_call_or_stream_active():
+            return True
+    except Exception:
+        pass
+    return False
 
 # ──────────────────────────────────────────────────────────────────────────────
 # AUTOSTART
 # ──────────────────────────────────────────────────────────────────────────────
+
 def set_autostart(enable=True):
     system = platform.system()
     if system == "Windows":
@@ -81,7 +439,7 @@ def set_autostart(enable=True):
             import winreg
             key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
             exe_path = sys.executable if getattr(sys, 'frozen', False) else \
-                       f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+                f'"{sys.executable}" "{os.path.abspath(__file__)}"'
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0,
                                 winreg.KEY_SET_VALUE) as key:
                 if enable:
@@ -91,14 +449,13 @@ def set_autostart(enable=True):
                     except FileNotFoundError: pass
         except Exception as e:
             print(f"Autostart error: {e}")
-
     elif system == "Linux":
-        autostart_dir = os.path.expanduser("~/.config/autostart")
-        desktop_file  = os.path.join(autostart_dir, "idlenote.desktop")
+        autostart_dir  = os.path.expanduser("~/.config/autostart")
+        desktop_file   = os.path.join(autostart_dir, "idlenote.desktop")
         os.makedirs(autostart_dir, exist_ok=True)
         if enable:
             exe = sys.executable if getattr(sys, 'frozen', False) else \
-                  f"{sys.executable} {os.path.abspath(__file__)}"
+                f"{sys.executable} {os.path.abspath(__file__)}"
             content = f"""[Desktop Entry]
 Type=Application
 Name=IdleNote
@@ -113,7 +470,6 @@ X-GNOME-Autostart-enabled=true
             if os.path.exists(desktop_file):
                 os.remove(desktop_file)
 
-
 def is_autostart_enabled():
     system = platform.system()
     if system == "Windows":
@@ -122,17 +478,17 @@ def is_autostart_enabled():
             key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
                 winreg.QueryValueEx(key, "IdleNote")
-                return True
+            return True
         except Exception:
             return False
     elif system == "Linux":
         return os.path.exists(os.path.expanduser("~/.config/autostart/idlenote.desktop"))
     return False
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # IDLE TRACKER
 # ──────────────────────────────────────────────────────────────────────────────
+
 class IdleTracker:
     def __init__(self):
         self.last_kb    = time.time()
@@ -177,16 +533,16 @@ class IdleTracker:
             try: self._mouse_listener.stop()
             except: pass
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # SETTINGS WINDOW
 # ──────────────────────────────────────────────────────────────────────────────
+
 class SettingsWindow:
     def __init__(self, app):
         self.app = app
 
     def open(self):
-        s   = self.app.settings
+        s = self.app.settings
         win = tk.Toplevel()
         win.title("IdleNote — Settings")
         win.resizable(False, False)
@@ -194,11 +550,11 @@ class SettingsWindow:
         win.attributes("-topmost", True)
 
         # Header
-        tk.Label(win, text="✦  IDLENOTE SETTINGS",
+        tk.Label(win, text="✦ IDLENOTE SETTINGS",
                  bg="#13131a", fg="#ff6b2b",
                  font=("Consolas", 11, "bold")).grid(
-                 row=0, column=0, columnspan=3,
-                 padx=20, pady=(18, 10), sticky="w")
+            row=0, column=0, columnspan=3,
+            padx=20, pady=(18, 10), sticky="w")
 
         lbl = dict(bg="#13131a", fg="#888899", font=("Consolas", 9), anchor="w")
         val = dict(bg="#13131a", fg="#ffaa44", font=("Consolas", 9), width=4, anchor="e")
@@ -216,8 +572,8 @@ class SettingsWindow:
             disp.grid(row=row, column=2, padx=(4,20))
             return var
 
-        kb_var    = slider_row(1, "Keyboard idle (s)",  "kb_idle_secs",    2, 30)
-        mouse_var = slider_row(2, "Mouse idle (s)",      "mouse_idle_secs", 2, 30)
+        kb_var    = slider_row(1, "Keyboard idle (s)", "kb_idle_secs",    2, 30)
+        mouse_var = slider_row(2, "Mouse idle (s)",    "mouse_idle_secs", 2, 30)
 
         # Opacity row
         tk.Label(win, text="Opacity (%)", **lbl).grid(
@@ -266,7 +622,6 @@ class SettingsWindow:
                   relief="flat", padx=16, pady=7,
                   activebackground="#ff8c4a",
                   cursor="hand2").pack(side="left")
-
         tk.Button(btn_frame, text="Cancel",
                   command=win.destroy,
                   bg="#252530", fg="#888899",
@@ -277,15 +632,14 @@ class SettingsWindow:
 
         win.update_idletasks()
         sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-        ww, wh = win.winfo_reqwidth(),   win.winfo_reqheight()
+        ww, wh = win.winfo_reqwidth(),    win.winfo_reqheight()
         win.geometry(f"+{(sw-ww)//2}+{(sh-wh)//2}")
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # MAIN APP
 # ──────────────────────────────────────────────────────────────────────────────
-class IdleNoteApp:
 
+class IdleNoteApp:
     FADE_STEPS = 14
     FADE_MS    = 14
 
@@ -299,11 +653,9 @@ class IdleNoteApp:
         self._cur_alpha = 0.0
         self._dragging  = False
         self._drag_ox = self._drag_oy = 0
-
         self._build_window()
         self._load_note()
         self.tracker.start()
-
         if HAS_TRAY:
             self._build_tray()
 
@@ -311,9 +663,30 @@ class IdleNoteApp:
         if not is_autostart_enabled():
             set_autostart(True)
 
+        # ── FIX: intercept OS/WM close so the window only hides ──────────
+        # Without this, closing the window on Linux destroys the Tk root
+        # and the whole process exits — even when running detached.
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close_btn)
+
+        # ── FIX: handle SIGTERM / SIGHUP gracefully (terminal detach) ────
+        # When you close the terminal or the session ends, the OS sends
+        # SIGHUP to the process. We catch it so the process keeps running.
+        if platform.system() != "Windows":
+            signal.signal(signal.SIGHUP, self._handle_signal)
+            signal.signal(signal.SIGTERM, self._handle_signal)
+
         self._poll()
 
-    # ── BUILD WINDOW ──────────────────────────────────────────────────────────
+    def _handle_signal(self, signum, frame):
+        """Called on SIGHUP / SIGTERM. Save and keep running (SIGHUP) or quit (SIGTERM)."""
+        self._do_save()
+        if signum == signal.SIGTERM:
+            # Schedule a clean quit on the Tk event loop thread
+            self.root.after(0, self._quit)
+        # SIGHUP → just keep running (terminal was closed, process stays alive)
+
+    # ── BUILD WINDOW ──────────────────────────────────────────────────────
+
     def _build_window(self):
         self.root = tk.Tk()
         self.root.title("IdleNote")
@@ -323,7 +696,7 @@ class IdleNoteApp:
         self.root.configure(bg="#0d0d12")
         self.root.withdraw()
 
-        s    = self.settings
+        s = self.settings
         W, H = int(s["width"]), int(s["height"])
 
         # Position
@@ -332,17 +705,17 @@ class IdleNoteApp:
             sw = self.root.winfo_screenwidth()
             sh = self.root.winfo_screenheight()
             x  = sw - W - 16
-            y  = sh - H - 52   # above taskbar
+            y  = sh - H - 52    # above taskbar
         self.root.geometry(f"{W}x{H}+{int(x)}+{int(y)}")
 
-        # ── OUTER SHELL ───────────────────────────────────────────────────────
+        # ── OUTER SHELL ───────────────────────────────────────────────────
         self.shell = tk.Frame(self.root, bg="#1a1a24",
                               highlightthickness=1,
                               highlightbackground="#2c2c40",
                               highlightcolor="#ff6b2b")
         self.shell.pack(fill="both", expand=True)
 
-        # ── TITLE BAR ─────────────────────────────────────────────────────────
+        # ── TITLE BAR ─────────────────────────────────────────────────────
         self.bar = tk.Frame(self.shell, bg="#111118", height=30)
         self.bar.pack(fill="x")
         self.bar.pack_propagate(False)
@@ -363,8 +736,8 @@ class IdleNoteApp:
                                   font=("Consolas", 10),
                                   cursor="hand2", padx=10)
         self.btn_close.pack(side="right")
-        self.btn_close.bind("<Enter>",  lambda e: self.btn_close.config(fg="#ff5555"))
-        self.btn_close.bind("<Leave>",  lambda e: self.btn_close.config(fg="#3a3a50"))
+        self.btn_close.bind("<Enter>",    lambda e: self.btn_close.config(fg="#ff5555"))
+        self.btn_close.bind("<Leave>",    lambda e: self.btn_close.config(fg="#3a3a50"))
         self.btn_close.bind("<Button-1>", self._on_close_btn)
 
         # Last-edited label
@@ -375,11 +748,11 @@ class IdleNoteApp:
 
         # Drag bindings on bar
         for w in (self.bar, self.lbl_icon, self.lbl_title):
-            w.bind("<ButtonPress-1>",   self._drag_start)
-            w.bind("<B1-Motion>",       self._drag_motion)
-            w.bind("<ButtonRelease-1>", self._drag_end)
+            w.bind("<ButtonPress-1>",  self._drag_start)
+            w.bind("<B1-Motion>",      self._drag_motion)
+            w.bind("<ButtonRelease-1>",self._drag_end)
 
-        # ── TEXT AREA ─────────────────────────────────────────────────────────
+        # ── TEXT AREA ─────────────────────────────────────────────────────
         txt_frame = tk.Frame(self.shell, bg="#0f0f17")
         txt_frame.pack(fill="both", expand=True)
 
@@ -405,7 +778,7 @@ class IdleNoteApp:
                                activebackground="#ff6b2b")
         self.txt.configure(yscrollcommand=self._sb_set)
 
-        # ── FOOTER ────────────────────────────────────────────────────────────
+        # ── FOOTER ────────────────────────────────────────────────────────
         self.footer = tk.Frame(self.shell, bg="#111118", height=22)
         self.footer.pack(fill="x")
         self.footer.pack_propagate(False)
@@ -420,9 +793,9 @@ class IdleNoteApp:
                              bg="#111118", fg="#2a2a3c",
                              font=("Consolas", 8), cursor="sizing")
         self.grip.pack(side="right", padx=(0, 4))
-        self.grip.bind("<ButtonPress-1>",  self._resize_start)
-        self.grip.bind("<B1-Motion>",      self._resize_motion)
-        self.grip.bind("<ButtonRelease-1>", self._resize_end)
+        self.grip.bind("<ButtonPress-1>",   self._resize_start)
+        self.grip.bind("<B1-Motion>",        self._resize_motion)
+        self.grip.bind("<ButtonRelease-1>",  self._resize_end)
 
         # Saved indicator
         self.lbl_saved = tk.Label(self.footer, text="",
@@ -430,12 +803,12 @@ class IdleNoteApp:
                                   font=("Consolas", 7))
         self.lbl_saved.pack(side="left", padx=10)
 
-        # ── TEXT BINDINGS ─────────────────────────────────────────────────────
+        # ── TEXT BINDINGS ─────────────────────────────────────────────────
         self.txt.bind("<<Modified>>", self._on_modified)
 
         # Right-click menu
-        self.txt.bind("<Button-3>",   self._ctx_menu)
-        self.bar.bind("<Button-3>",   self._ctx_menu)
+        self.txt.bind("<Button-3>", self._ctx_menu)
+        self.bar.bind("<Button-3>", self._ctx_menu)
 
     def _sb_set(self, lo, hi):
         if float(lo) <= 0.0 and float(hi) >= 1.0:
@@ -445,6 +818,7 @@ class IdleNoteApp:
             self.sb.set(lo, hi)
 
     # ── DRAG ──────────────────────────────────────────────────────────────────
+
     def _drag_start(self, e):
         self._dragging = True
         self._drag_ox  = e.x_root - self.root.winfo_x()
@@ -461,6 +835,7 @@ class IdleNoteApp:
         save_settings(self.settings)
 
     # ── RESIZE ────────────────────────────────────────────────────────────────
+
     def _resize_start(self, e):
         self._rx = e.x_root; self._ry = e.y_root
         self._rw = self.root.winfo_width()
@@ -477,6 +852,7 @@ class IdleNoteApp:
         save_settings(self.settings)
 
     # ── NOTE I/O ──────────────────────────────────────────────────────────────
+
     def _load_note(self):
         if os.path.exists(NOTES_FILE):
             try:
@@ -511,11 +887,12 @@ class IdleNoteApp:
 
     def _update_footer(self):
         content = self.txt.get("1.0", "end-1c")
-        words    = len(content.split()) if content.strip() else 0
-        chars    = len(content)
-        self.lbl_chars.config(text=f"{words}w  {chars}c")
+        words = len(content.split()) if content.strip() else 0
+        chars = len(content)
+        self.lbl_chars.config(text=f"{words}w {chars}c")
 
     # ── SHOW / HIDE ───────────────────────────────────────────────────────────
+
     def show(self):
         if self._visible: return
         self._visible = True
@@ -526,10 +903,19 @@ class IdleNoteApp:
         self.txt.focus_set()
 
     def _on_close_btn(self, e=None):
+        """
+        Called when the user clicks ✕ OR when the window manager sends a
+        delete-window event (e.g. alt+F4, or closing from a taskbar).
+        We always HIDE (withdraw) instead of destroying, so the process
+        stays alive.
+        """
         if self._visible:
             self._visible = False
             self._do_save()
             self._fade_to(0.0, on_done=self.root.withdraw)
+        else:
+            # Window was already hidden; make sure it's withdrawn
+            self.root.withdraw()
 
     def _fade_to(self, target, on_done=None):
         if self._fade_job:
@@ -553,6 +939,7 @@ class IdleNoteApp:
         step(steps, current)
 
     # ── IDLE POLL ─────────────────────────────────────────────────────────────
+
     def _poll(self):
         kb_idle    = self.tracker.idle_kb_secs()
         mouse_idle = self.tracker.idle_mouse_secs()
@@ -560,11 +947,14 @@ class IdleNoteApp:
         mouse_th   = self.settings["mouse_idle_secs"]
 
         if kb_idle >= kb_th and mouse_idle >= mouse_th and not self._visible:
-            self.show()
+            # Only show if media/calls are not active
+            if not should_suppress():
+                self.show()
 
         self._poll_job = self.root.after(500, self._poll)
 
     # ── CONTEXT MENU ─────────────────────────────────────────────────────────
+
     def _ctx_menu(self, e):
         m = tk.Menu(self.root, tearoff=0,
                     bg="#1a1a24", fg="#d4cfc8",
@@ -589,37 +979,34 @@ class IdleNoteApp:
             self._do_save()
 
     # ── APPLY SETTINGS ───────────────────────────────────────────────────────
+
     def apply_settings(self):
         if self._visible:
             self.root.attributes("-alpha", self.settings.get("opacity", 0.95))
 
     # ── TRAY ─────────────────────────────────────────────────────────────────
+
     def _build_tray(self):
         def make_icon(size=64):
             img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
             d   = ImageDraw.Draw(img)
             m   = size // 8
-            # Background card
             d.rounded_rectangle([m, m, size-m, size-m],
                                  radius=size//8,
                                  fill=(20, 20, 30),
                                  outline=(255, 107, 43), width=max(2, size//24))
-            # Three text lines
             lc = (180, 170, 160)
             lx1, lx2 = m*2+2, size-m*2-2
-            ly  = [int(size*0.36), int(size*0.52), int(size*0.68)]
-            lw  = max(1, size//32)
-            d.line([(lx1, ly[0]), (lx2, ly[0])], fill=lc, width=lw)
+            ly = [int(size*0.36), int(size*0.52), int(size*0.68)]
+            lw = max(1, size//32)
+            d.line([(lx1, ly[0]), (lx2,         ly[0])], fill=lc, width=lw)
             d.line([(lx1, ly[1]), (lx2-size//6, ly[1])], fill=lc, width=lw)
             d.line([(lx1, ly[2]), (lx2-size//4, ly[2])], fill=lc, width=lw)
-            # Accent dot
             r = max(3, size//14)
-            d.ellipse([size-m-r*2, m, size-m, m+r*2],
-                      fill=(255, 107, 43))
+            d.ellipse([size-m-r*2, m, size-m, m+r*2], fill=(255, 107, 43))
             return img
 
         def on_left_click(icon, item=None):
-            # pystray passes item=None for a direct left-click on some platforms
             self.root.after(0, self.show)
 
         def on_settings(icon, item):
@@ -629,18 +1016,17 @@ class IdleNoteApp:
             self.root.after(0, self._quit)
 
         menu = pystray.Menu(
-            pystray.MenuItem("Open IdleNote",  on_left_click, default=True),
-            pystray.MenuItem("Settings",       on_settings),
+            pystray.MenuItem("Open IdleNote", on_left_click, default=True),
+            pystray.MenuItem("Settings",      on_settings),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit",           on_quit),
+            pystray.MenuItem("Quit",          on_quit),
         )
-
         self._tray_icon = pystray.Icon(
             "IdleNote", make_icon(), "IdleNote — click to open", menu)
-
         threading.Thread(target=self._tray_icon.run, daemon=True).start()
 
     # ── QUIT ─────────────────────────────────────────────────────────────────
+
     def _quit(self):
         self._do_save()
         self.tracker.stop()
@@ -650,16 +1036,17 @@ class IdleNoteApp:
         self.root.destroy()
 
     # ── RUN ──────────────────────────────────────────────────────────────────
+
     def run(self):
         try:
             self.root.mainloop()
         except KeyboardInterrupt:
             self._quit()
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # SINGLE-INSTANCE GUARD + ENTRY
 # ──────────────────────────────────────────────────────────────────────────────
+
 def main():
     lock_file = os.path.join(APP_DIR, "idlenote.lock")
     system    = platform.system()
@@ -683,7 +1070,6 @@ def main():
 
     app = IdleNoteApp()
     app.run()
-
 
 if __name__ == "__main__":
     main()
