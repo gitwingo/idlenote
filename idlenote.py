@@ -76,24 +76,17 @@ def save_settings(s):
 # MEDIA / CALL DETECTION  (Linux + Windows)
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Process names that indicate an active video call or meeting
+# Process names where simply RUNNING means a call/stream is active.
+# Only include apps that have no idle/background state — i.e. if the
+# process exists, something live is happening.
+# Apps like Discord, Slack, Teams, Skype sit in the tray normally,
+# so we detect their active-call state via window titles instead.
 _CALL_PROCESS_NAMES = {
-    # Zoom
+    # Zoom: only spawns its main process during a meeting
     "zoom", "zoom.exe",
-    # Microsoft Teams (classic + new)
-    "teams", "teams.exe", "ms-teams", "ms-teams.exe",
-    # Google Meet runs in browsers — handled separately via browser check
-    # Slack calls
-    "slack", "slack.exe",
-    # Discord voice/video
-    "discord", "discord.exe",
-    # Skype
-    "skype", "skype.exe",
-    # Webex
-    "webex", "webex.exe", "ciscowebexmeetings", "ciscowebexmeetings.exe",
-    # Jitsi
-    "jitsi meet", "jitsi",
-    # OBS (streaming / recording)
+    # Webex meeting client (separate from the launcher)
+    "ciscowebexmeetings", "ciscowebexmeetings.exe",
+    # OBS: if it is running, you are streaming/recording
     "obs", "obs64", "obs.exe",
 }
 
@@ -101,22 +94,41 @@ _CALL_PROCESS_NAMES = {
 _BROWSER_NAMES = {"chrome", "chromium", "firefox", "brave", "msedge",
                   "opera", "vivaldi", "waterfox"}
 
-# Keywords in browser window titles that signal a live call / stream
+# Window title keywords that reliably indicate an ACTIVE call or live stream.
+# Checked against ALL window titles (not just browsers) so they catch
+# Discord, Slack, Teams, Skype native apps too when a call is live.
+#   Discord during call  -> "Username - Call" or "Group Call"
+#   Slack during huddle  -> "Slack | Calls" or "Huddle"
+#   Teams during meeting -> "Microsoft Teams - Meeting"
+#   Skype during call    -> "Skype | On a call"
 _CALL_TITLE_KEYWORDS = {
-    "google meet", "meet.google", "zoom meeting",
-    "microsoft teams", "teams meeting",
-    "slack call", "discord call",
-    "webex meeting", "jitsi",
-    "youtube live", "twitch",          # streaming (you're the viewer/host)
+    # Generic call indicators
+    "- call",
+    "group call",
+    "on a call",
+    "calling…", "calling...",
+    "in a meeting",
+    # App-specific active states
+    "google meet",
+    "zoom meeting",
+    "teams meeting", "teams | meeting",
+    "slack | calls", "slack calls", "huddle",
+    "webex meeting",
+    "jitsi",
+    # Live streaming
+    "youtube live",
+    "twitch",
 }
 
 
 def _run(cmd):
-    """Run a shell command and return stdout, swallowing all errors."""
+    """Run a shell command and return stdout, swallowing all errors.
+    On Windows, CREATE_NO_WINDOW prevents the brief CMD flash."""
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=2
-        )
+        kwargs = dict(capture_output=True, text=True, timeout=2)
+        if platform.system() == "Windows":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        result = subprocess.run(cmd, **kwargs)
         return result.stdout.strip()
     except Exception:
         return ""
@@ -390,43 +402,68 @@ def _get_browser_window_titles() -> list:
     return titles
 
 
+def _get_all_window_titles() -> list:
+    """
+    Return titles of ALL visible windows (not just browsers).
+    On Linux delegates to _get_browser_window_titles which already
+    enumerates all windows; on Windows uses the same ctypes path.
+    """
+    # On Linux the existing function already returns all windows via
+    # xdotool/wmctrl regardless of app — reuse it directly.
+    if platform.system() == "Linux":
+        return _get_browser_window_titles()
+    # On Windows _get_browser_window_titles already enumerates every
+    # visible window via EnumWindows, so reuse it here too.
+    return _get_browser_window_titles()
+
+
 def is_call_or_stream_active() -> bool:
     """
     Returns True if a video call, meeting, or media stream is likely
-    in progress. Checks running processes and browser window titles.
+    in progress. Checks running processes and ALL window titles.
     """
     procs = _get_running_process_names()
 
-    # Direct process match
+    # Direct process match (only apps where running == active call)
     for call_proc in _CALL_PROCESS_NAMES:
         if call_proc in procs:
             return True
 
-    # Browser open? Check window titles for call/stream keywords
-    browser_running = any(b in procs for b in _BROWSER_NAMES)
-    if browser_running:
-        titles = _get_browser_window_titles()
-        for title in titles:
-            for kw in _CALL_TITLE_KEYWORDS:
-                if kw in title:
-                    return True
+    # Check ALL window titles — this catches Discord, Slack, Teams, Skype
+    # native apps in an active call as well as browser-based calls.
+    titles = _get_all_window_titles()
+    for title in titles:
+        for kw in _CALL_TITLE_KEYWORDS:
+            if kw in title:
+                return True
 
     return False
+
+
+# Cache for should_suppress() — re-evaluated every 5 seconds so we are
+# not spawning subprocesses on every 500 ms poll tick.
+_suppress_cache: bool = False
+_suppress_cache_time: float = 0.0
+_SUPPRESS_CACHE_TTL: float = 5.0   # seconds
 
 
 def should_suppress() -> bool:
     """
     Master suppression check: returns True when IdleNote should NOT appear.
-    Runs quickly enough to be called every 500 ms.
+    Result is cached for _SUPPRESS_CACHE_TTL seconds to avoid hammering
+    subprocesses (and flashing CMD windows) on every poll tick.
     """
+    global _suppress_cache, _suppress_cache_time
+    now = time.time()
+    if now - _suppress_cache_time < _SUPPRESS_CACHE_TTL:
+        return _suppress_cache
     try:
-        if is_audio_playing():
-            return True
-        if is_call_or_stream_active():
-            return True
+        result = is_audio_playing() or is_call_or_stream_active()
     except Exception:
-        pass
-    return False
+        result = False
+    _suppress_cache = result
+    _suppress_cache_time = now
+    return result
 
 # ──────────────────────────────────────────────────────────────────────────────
 # AUTOSTART
