@@ -7,6 +7,7 @@ Stop typing or moving your mouse for a few seconds — IdleNote fades in at the 
 No hotkey to remember. No window to hunt for. Just your thoughts, surfacing exactly when your hands stop.
 
 ---
+<img width="2115" height="1410" alt="idlenote ss final" src="https://github.com/user-attachments/assets/b5c45ed1-9be6-4bfc-8b88-cb8e00756734" />
 
 ## Download
 
