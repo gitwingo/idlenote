@@ -9,8 +9,6 @@ No hotkey to remember. No window to hunt for. Just your thoughts, surfacing exac
 ---
 <img width="2115" height="1410" alt="idlenote ss final" src="https://github.com/user-attachments/assets/b5c45ed1-9be6-4bfc-8b88-cb8e00756734" />
 
-> Screenshot is from a previous version — colors and layout have since improved (see below). Swap in a fresh one when you release.
-
 ---
 
 ## ✨ What's new in this release
